@@ -19,6 +19,10 @@ Toggling again removes the temporary workspace, moves the window back to where
 it was, and turns fullscreen off — exactly the macOS "Space is born, Space is
 destroyed" lifecycle.
 
+If the window is already **alone** on its workspace, there is nothing to leave
+behind, so it is simply fullscreened in place: no extra workspace is created and
+no workspace is renamed.
+
 ## Requirements
 
 - niri (tested against the 26.x IPC)
@@ -107,13 +111,13 @@ niri's workspaces are a dynamic stack per output and it does **not** expose an
 5. `unset-workspace-name` turns the temporary workspace back into a normal one;
    it persists only because it now holds the window.
 
-The origin workspace is preserved the same way. If moving the window out would
-leave it empty (it had no other windows), it too gets a temporary name so niri
-does not delete the desktop you came from. On exit the name is removed again.
+A window that is already alone on its workspace skips all of this: its workspace
+already *is* a dedicated desktop, so it is fullscreened in place. This avoids
+born-and-destroying a second workspace and leaving the now-empty origin behind
+under a temporary name.
 
 State lives in `$XDG_RUNTIME_DIR/fullscreen-niri/state.json` (or `/tmp`). Windows
-that were closed while fullscreen are dropped on the next run, which also removes
-the temporary name from their origin workspace.
+that were closed while fullscreen are dropped on the next run.
 
 ## Why macOS does this, and Linux usually doesn't
 

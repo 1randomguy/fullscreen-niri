@@ -142,13 +142,20 @@ def enter(window: dict) -> None:
         die("the focused window's workspace is not on any output")
 
     siblings = windows_on_workspace(windows(), origin["id"])
-    needs_pin = origin.get("name") is None and len(siblings) <= 1
-    pin_name = None
-    if needs_pin:
-        pin_name = f"{NAME_PREFIX}-origin-{token()}"
-        action("set-workspace-name", pin_name, "--workspace", str(origin["idx"]))
-        ws_list = workspaces()
-        origin = find_workspace(ws_list, window["workspace_id"]) or origin
+    if len(siblings) <= 1:
+        # The window already has its workspace to itself, so there is no sibling
+        # to leave behind. Fullscreen it in place instead of born-and-destroying a
+        # second workspace and preserving (naming) the now-empty origin.
+        action("fullscreen-window", "--id", str(wid))
+        state[str(wid)] = {
+            "origin_ws_id": origin["id"],
+            "origin_idx": origin["idx"],
+            "pinned": False,
+            "pin_name": None,
+        }
+        save_state(state)
+        print(f"window {wid} fullscreened in place on workspace {origin['id']}")
+        return
 
     bottom = bottom_workspace(ws_list, output)
     if bottom is None:
@@ -166,8 +173,8 @@ def enter(window: dict) -> None:
     state[str(wid)] = {
         "origin_ws_id": origin["id"],
         "origin_idx": origin["idx"],
-        "pinned": needs_pin,
-        "pin_name": pin_name,
+        "pinned": False,
+        "pin_name": None,
     }
     save_state(state)
     print(f"window {wid} moved to a new fullscreen workspace after index {origin['idx']}")
