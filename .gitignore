@@ -1,0 +1,13 @@
+# Nix build output
+/result
+/result-*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# direnv
+.direnv/
