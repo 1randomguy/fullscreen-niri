@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""macOS-style "fullscreen takes its own workspace" behaviour for niri.
+
+A window toggled into macOS-style fullscreen is moved to a brand new
+workspace inserted immediately after its origin workspace, then put into
+niri's real fullscreen. Toggling again restores the window to its origin
+workspace and lets the temporary workspace disappear.
+
+Only the Python standard library and `niri` are required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+NAME_PREFIX = "__fs"
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"fullscreen-niri: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def niri(args: list[str], want_json: bool = False) -> str:
+    cmd = ["niri", "msg"]
+    if want_json:
+        cmd.append("--json")
+    cmd.extend(args)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        die("`niri` was not found in PATH")
+    except subprocess.TimeoutExpired:
+        die(f"niri did not answer in time: {' '.join(cmd)}")
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        die(f"`{' '.join(cmd)}` failed: {detail}")
+    return proc.stdout
+
+
+def niri_json(args: list[str]):
+    return json.loads(niri(args, want_json=True))
+
+
+def action(*args: str) -> None:
+    niri(["action", *args])
+
+
+def windows() -> list[dict]:
+    return niri_json(["windows"])
+
+
+def workspaces() -> list[dict]:
+    return niri_json(["workspaces"])
+
+
+def focused_window() -> dict | None:
+    return niri_json(["focused-window"])
+
+
+def state_path() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    root = Path(base) if base else Path("/tmp")
+    directory = root / "fullscreen-niri"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "state.json"
+
+
+def load_state() -> dict:
+    path = state_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    path = state_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(path)
+
+
+def token() -> str:
+    return f"{int(time.time() * 1000):x}-{os.getpid():x}"
+
+
+def find_workspace(ws_list: list[dict], ws_id: int) -> dict | None:
+    return next((ws for ws in ws_list if ws["id"] == ws_id), None)
+
+
+def windows_on_workspace(win_list: list[dict], ws_id: int) -> list[dict]:
+    return [w for w in win_list if w.get("workspace_id") == ws_id]
+
+
+def bottom_workspace(ws_list: list[dict], output: str | None) -> dict | None:
+    candidates = [ws for ws in ws_list if ws.get("output") == output]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda ws: ws["idx"])
+
+
+def prune(state: dict) -> None:
+    win_list = windows()
+    live = {w["id"] for w in win_list}
+    changed = False
+    for key in list(state):
+        if int(key) in live:
+            continue
+        entry = state.pop(key)
+        if entry.get("pinned"):
+            try:
+                action("unset-workspace-name", entry["pin_name"])
+            except SystemExit:
+                pass
+        changed = True
+    if changed:
+        save_state(state)
+
+
+def enter(window: dict) -> None:
+    state = load_state()
+    wid = window["id"]
+    if str(wid) in state:
+        print(f"window {wid} is already in macOS fullscreen")
+        return
+
+    ws_list = workspaces()
+    origin = find_workspace(ws_list, window.get("workspace_id"))
+    if origin is None:
+        die("could not locate the focused window's workspace")
+    output = origin.get("output")
+    if output is None:
+        die("the focused window's workspace is not on any output")
+
+    siblings = windows_on_workspace(windows(), origin["id"])
+    needs_pin = origin.get("name") is None and len(siblings) <= 1
+    pin_name = None
+    if needs_pin:
+        pin_name = f"{NAME_PREFIX}-origin-{token()}"
+        action("set-workspace-name", pin_name, "--workspace", str(origin["idx"]))
+        ws_list = workspaces()
+        origin = find_workspace(ws_list, window["workspace_id"]) or origin
+
+    bottom = bottom_workspace(ws_list, output)
+    if bottom is None:
+        die("could not find a free workspace to build the fullscreen space from")
+    if bottom["id"] == origin["id"]:
+        die("the origin workspace is the only workspace; nothing to insert")
+
+    fs_name = f"{NAME_PREFIX}-space-{token()}"
+    action("set-workspace-name", fs_name, "--workspace", str(bottom["idx"]))
+    action("move-workspace-to-index", str(origin["idx"] + 1), "--reference", fs_name)
+    action("move-window-to-workspace", fs_name, "--window-id", str(wid))
+    action("fullscreen-window", "--id", str(wid))
+    action("unset-workspace-name", fs_name)
+
+    state[str(wid)] = {
+        "origin_ws_id": origin["id"],
+        "origin_idx": origin["idx"],
+        "pinned": needs_pin,
+        "pin_name": pin_name,
+    }
+    save_state(state)
+    print(f"window {wid} moved to a new fullscreen workspace after index {origin['idx']}")
+
+
+def exit_fullscreen(state: dict, wid: int) -> None:
+    entry = state.pop(str(wid))
+    action("fullscreen-window", "--id", str(wid))
+
+    ws_list = workspaces()
+    origin = find_workspace(ws_list, entry["origin_ws_id"])
+    if origin is not None:
+        target_idx = origin["idx"]
+    else:
+        same_output = sorted(ws_list, key=lambda ws: ws["idx"])
+        target_idx = min(entry["origin_idx"], len(same_output)) if same_output else 1
+        target_idx = max(1, target_idx)
+
+    action("move-window-to-workspace", str(target_idx), "--window-id", str(wid))
+
+    if entry.get("pinned") and entry.get("pin_name"):
+        try:
+            action("unset-workspace-name", entry["pin_name"])
+        except SystemExit:
+            pass
+
+    save_state(state)
+    print(f"window {wid} restored to workspace index {target_idx}")
+
+
+def toggle(window: dict | None) -> None:
+    if window is None:
+        die("no window is focused")
+    state = load_state()
+    if str(window["id"]) in state:
+        exit_fullscreen(state, window["id"])
+    else:
+        enter(window)
+
+
+def status(state: dict) -> None:
+    if not state:
+        print("no windows in macOS fullscreen")
+        return
+    win_list = {w["id"]: w for w in windows()}
+    for key, entry in state.items():
+        wid = int(key)
+        win = win_list.get(wid)
+        title = (win or {}).get("title") or (win or {}).get("app_id") or "?"
+        print(f"{wid}  origin_ws={entry['origin_ws_id']}  pinned={entry['pinned']}  {title}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="fullscreen-niri",
+        description="macOS-style per-workspace fullscreen for niri",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="toggle",
+        choices=["toggle", "enter", "exit", "status", "prune"],
+        help="action to perform (default: toggle)",
+    )
+    parser.add_argument("--window-id", type=int, help="operate on a specific window id")
+    args = parser.parse_args()
+
+    # Drop state for windows that were closed while in macOS fullscreen, so
+    # their temporary origin workspace names do not linger.
+    state = load_state()
+    prune(state)
+
+    if args.command == "status":
+        status(state)
+        return
+
+    if args.command == "prune":
+        return
+
+    if args.window_id is not None:
+        window = next((w for w in windows() if w["id"] == args.window_id), None)
+        if window is None:
+            die(f"window {args.window_id} does not exist")
+    else:
+        window = focused_window()
+
+    if args.command == "enter":
+        if window is None:
+            die("no window is focused")
+        enter(window)
+    elif args.command == "exit":
+        if window is None:
+            die("no window is focused")
+        state = load_state()
+        if str(window["id"]) not in state:
+            die(f"window {window['id']} is not in macOS fullscreen")
+        exit_fullscreen(state, window["id"])
+    else:
+        toggle(window)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit(130)
